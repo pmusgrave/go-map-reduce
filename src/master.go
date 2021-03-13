@@ -1,6 +1,6 @@
 package mr
 
-// import "fmt"
+//import "fmt"
 import "log"
 import "net"
 import "os"
@@ -8,6 +8,8 @@ import "path/filepath"
 import "net/rpc"
 import "net/http"
 import "strconv"
+
+// import "strings"
 import "sync"
 import "time"
 
@@ -20,17 +22,28 @@ type Task struct {
 
 type Master struct {
 	mapch         chan Task
+	map_done      bool
 	map_status    map[int]Task
 	mu            sync.Mutex
 	nReduce       int
 	reducech      chan Task
+	reduce_done   bool
 	reduce_set    map[int]struct{}
 	reduce_status map[int]Task
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (m *Master) GetTask(args *Args, reply *Reply) error {
-	if len(m.mapch) > 0 {
+	m.UpdateMapStatus()
+	m.UpdateReduceStatus()
+	m.mu.Lock()
+	map_done := m.map_done
+	reduce_done := m.reduce_done
+	m.mu.Unlock()
+	if len(m.mapch) > 0 || !map_done {
+		for len(m.mapch) == 0 {
+			time.Sleep(1000 * time.Millisecond)
+		}
 		m.mu.Lock()
 		task := <-m.mapch
 		reply.Id = task.id
@@ -44,19 +57,15 @@ func (m *Master) GetTask(args *Args, reply *Reply) error {
 		m.map_status[task.id] = task
 
 		m.mu.Unlock()
-	} else if len(m.reducech) > 0 {
+	} else if len(m.reducech) > 0 || !reduce_done {
 		for m.MapTasksInProgress() {
-			time.Sleep(3000 * time.Millisecond)
+			time.Sleep(1000 * time.Millisecond)
+		}
+		for len(m.reducech) == 0 {
+			time.Sleep(1000 * time.Millisecond)
 		}
 
 		m.mu.Lock()
-		/*
-			reduce_keys := make([]int, 0, len(m.reduce_set))
-			for k := range m.reduce_set {
-				reduce_keys = append(reduce_keys, k)
-			}
-			// fmt.Println(m.reduce_set, m.reduce_index, reduce_keys)
-		*/
 		task := <-m.reducech
 		s := "mr-*-" + strconv.Itoa(task.id) + ".txt"
 		file_list, _ := filepath.Glob(s)
@@ -73,7 +82,6 @@ func (m *Master) GetTask(args *Args, reply *Reply) error {
 		reply.Id = -1
 	}
 
-	//reply.filename <- m.mapch
 	return nil
 }
 
@@ -84,6 +92,7 @@ func (m *Master) CompleteMapTask(args *CompleteMapArgs, reply *Reply) error {
 	task.status = "completed"
 	m.map_status[args.Id] = task
 	m.mu.Unlock()
+	m.UpdateMapStatus()
 	return nil
 }
 
@@ -131,21 +140,39 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	map_in_progress := m.MapTasksInProgress()
-	/*
-		m.mu.Lock()
-		for _, task := range m.map_status {
-			ts := time.Now()
-			if (ts.Sub(task.start)) >= 10000 {
+	//map_in_progress := m.MapTasksInProgress()
+	m.UpdateMapStatus()
+	m.UpdateReduceStatus()
+	m.mu.Lock()
+	for _, task := range m.map_status {
+		if task.status == "in-progress" {
+			ts := time.Since(task.start)
+			if ts > 10000*time.Millisecond {
+				//fmt.Printf("Map task %d timed out, diff=%d.\n", task.id, ts)
 				task.status = "idle"
 				m.map_status[task.id] = task
 				m.mapch <- task
+				m.mu.Unlock()
 				return false
 			}
 		}
-		m.mu.Unlock()
-	*/
-	return !map_in_progress && len(m.mapch) == 0 && len(m.reducech) == 0
+	}
+	for _, task := range m.reduce_status {
+		if task.status == "in-progress" {
+			ts := time.Since(task.start)
+			if ts > 10000*time.Millisecond {
+				//fmt.Printf("Reduce task %d timed out, diff=%d.\n", task.id, ts)
+				task.status = "idle"
+				m.map_status[task.id] = task
+				m.mapch <- task
+				m.mu.Unlock()
+				return false
+			}
+		}
+	}
+	m.mu.Unlock()
+	//return !map_in_progress && len(m.mapch) == 0 && len(m.reducech) == 0
+	return len(m.mapch) == 0 && len(m.reducech) == 0
 }
 
 func (m *Master) MapTasksInProgress() bool {
@@ -161,6 +188,30 @@ func (m *Master) MapTasksInProgress() bool {
 	return false
 }
 
+func (m *Master) UpdateMapStatus() {
+	m.mu.Lock()
+	m.map_done = true
+	for _, task := range m.map_status {
+		if task.status != "completed" {
+			m.map_done = false
+			// fmt.Printf("%d %s\n", task.id, task.status)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Master) UpdateReduceStatus() {
+	m.mu.Lock()
+	m.reduce_done = true
+	for _, task := range m.reduce_status {
+		if task.status != "completed" {
+			m.reduce_done = false
+			// fmt.Printf("%d %s\n", task.id, task.status)
+		}
+	}
+	m.mu.Unlock()
+}
+
 //
 // create a Master.
 // main/mrmaster.go calls this function.
@@ -169,6 +220,7 @@ func (m *Master) MapTasksInProgress() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 	m.nReduce = nReduce
+	m.map_done = false
 	m.map_status = make(map[int]Task)
 	m.mapch = make(chan Task, nReduce)
 	m.reducech = make(chan Task, nReduce)

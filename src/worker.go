@@ -1,6 +1,7 @@
 package mr
 
 import "encoding/json"
+import "github.com/satori/go.uuid"
 import "fmt"
 import "io/ioutil"
 import "log"
@@ -119,6 +120,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					intermediate = append(intermediate, kv)
 				}
 				file.Close()
+				defer os.Remove(reduce_filename)
 			}
 			sort.Sort(ByKey(intermediate))
 			// fmt.Println(intermediate)
@@ -156,37 +158,57 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply = GetTask()
 		id = reply.Id
 		filename = reply.Filename
+		intermediate = []KeyValue{}
 	}
 
 }
 
 func WriteIntermediate(intermediate []KeyValue, worker_id int, n_reduce int) {
+	initial_file_set := make(map[string][]KeyValue)
+	file_list := make(map[string][]KeyValue)
+	reduce_list := make(map[int]struct{})
+	real_filenames := make(map[string]string)
 	for _, pair := range intermediate {
 		s := []string{"mr-", strconv.Itoa(worker_id), "-", strconv.Itoa(ihash(pair.Key) % n_reduce), ".txt"}
 		filename := strings.Join(s, "")
-		f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		//f, err := os.Create(filename)
-
+		initial_file_set[filename] = append(initial_file_set[filename], pair)
+	}
+	for filename, pairs := range initial_file_set {
+		tmp_uuid, uuid_err := uuid.NewV4()
+		if uuid_err != nil {
+			log.Fatal(uuid_err)
+		}
+		tmp_filename := tmp_uuid.String()
+		/*tmp, err := ioutil.TempFile("", filename)
 		if err != nil {
 			log.Fatal(err)
-		}
-
-		AddReduceTask(ihash(pair.Key) % n_reduce)
-
-		enc := json.NewEncoder(f)
-		enc_err := enc.Encode(&pair)
-		if enc_err != nil {
-			log.Fatal(enc_err)
-		}
-
-		/*
-			line := pair.Key + " " + pair.Value
-			_, err2 := f.WriteString(line)
-			if err2 != nil {
-				log.Fatal(err2)
+		}*/
+		file_list[tmp_filename] = pairs
+		real_filenames[tmp_filename] = filename
+		//tmp.Close()
+	}
+	for filename, pairs := range file_list {
+		for _, pair := range pairs {
+			f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Fatal(err)
 			}
-		*/
-		f.Close()
+
+			reduce_list[ihash(pair.Key)%n_reduce] = struct{}{}
+
+			enc := json.NewEncoder(f)
+			enc_err := enc.Encode(&pair)
+			if enc_err != nil {
+				log.Fatal(enc_err)
+			}
+
+			f.Close()
+			defer os.Rename(filename, real_filenames[filename])
+			// defer os.Remove(filename)
+		}
+	}
+	for reduce_task, _ := range reduce_list {
+		AddReduceTask(reduce_task)
 	}
 }
 
@@ -194,7 +216,6 @@ func WriteOutput(output []KeyValue, worker_id int) {
 	for _, pair := range output {
 		s := []string{"mr-out", "-", strconv.Itoa(worker_id), ".txt"}
 		filename := strings.Join(s, "")
-		// f, err := os.Create(filename)
 		f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 
 		if err != nil {
